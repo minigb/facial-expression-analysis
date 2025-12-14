@@ -34,7 +34,8 @@ class EmotionsDlib():
     def __init__(
             self, 
             file_emotion_model, 
-            file_frontalization_model
+            file_frontalization_model,
+            use_torch_mps=False
             ):
         '''
         file_emotion_model: string
@@ -54,14 +55,23 @@ class EmotionsDlib():
         '''
             
         model = None
+        self.emotion_model = None
         self.full_features = True  # default feature size
+        self.use_torch = False
+        self.torch_device = None
+        self.torch_coef = None
+        self.torch_intercept = None
         
         # loading pickled emotion model
         try:
             model = load(file_emotion_model)
             print('Emotion model loaded successfully.')
-        except: 
-            print('Problem loading emotion model!')
+        except Exception as exc: 
+            raise RuntimeError(
+                f"Problem loading emotion model at {file_emotion_model}. "
+                "This repo expects scikit-learn==0.23.1 (see environment_requirements.yml). "
+                f"Original error: {exc}"
+            )
          
         if model is not None:
             self.emotion_model = model['model']
@@ -71,12 +81,71 @@ class EmotionsDlib():
                 'Model components:', self.components, 
                   ' | full feature size:', self.full_features
                   )
-        
+
+        if self.emotion_model is None:
+            raise RuntimeError("Emotion model not initialized.")
+
         # determine the size of features
         self.geom_feat = GeometricFeaturesDlib(full_size=self.full_features)        
         self.frontalizer = LandmarkFrontalizationDlib(
             file_frontalization_model=file_frontalization_model
             )
+
+        # Compatibility patch: models were trained with scikit-learn 0.23.1.
+        # Newer sklearn versions (e.g. 1.8) expect private attrs like _x_mean.
+        # Map from the public attrs if the private ones are missing so that
+        # predict() works without retraining.
+        for pub, priv in [
+            ("x_mean_", "_x_mean"),
+            ("x_std_", "_x_std"),
+            ("y_mean_", "_y_mean"),
+            ("y_std_", "_y_std"),
+        ]:
+            if hasattr(self.emotion_model, pub) and not hasattr(self.emotion_model, priv):
+                setattr(self.emotion_model, priv, getattr(self.emotion_model, pub))
+
+        # Fix coef_ orientation and missing intercept_ for newer sklearn.
+        try:
+            coef = self.emotion_model.coef_
+            n_features = self.geom_feat.feature_template.shape[0]
+            n_targets = coef.shape[1] if coef.ndim == 2 else 1
+            if coef.shape == (n_features, n_targets):
+                # stored as (n_features, n_targets) -> transpose to (n_targets, n_features)
+                coef = coef.T
+                self.emotion_model.coef_ = coef
+            # ensure intercept_ exists and has correct shape
+            if not hasattr(self.emotion_model, "intercept_"):
+                self.emotion_model.intercept_ = getattr(
+                    self.emotion_model, "y_mean_", [0] * n_targets
+                )
+            # normalize intercept shape to (n_targets,)
+            import numpy as np  # local import to avoid top-level dependency
+            self.emotion_model.intercept_ = np.array(self.emotion_model.intercept_).reshape(-1)
+            # sklearn>=1.x expects _predict_1d flag
+            if not hasattr(self.emotion_model, "_predict_1d"):
+                self.emotion_model._predict_1d = False
+        except Exception:
+            # If anything goes wrong, fall back to existing coef_ and let sklearn raise.
+            pass
+
+        # Optional torch acceleration (MPS if available)
+        if use_torch_mps:
+            try:
+                import torch
+                if torch.backends.mps.is_available():
+                    self.use_torch = True
+                    self.torch_device = torch.device("mps")
+                    coef = self.emotion_model.coef_  # (n_targets, n_features)
+                    # store as (n_features, n_targets) for matmul
+                    self.torch_coef = torch.as_tensor(coef.T, dtype=torch.float32, device=self.torch_device)
+                    self.torch_intercept = torch.as_tensor(
+                        self.emotion_model.intercept_, dtype=torch.float32, device=self.torch_device
+                    )
+                    print("Torch MPS acceleration enabled.")
+                else:
+                    print("Torch MPS not available; using CPU sklearn.")
+            except Exception as exc:
+                print(f"Torch/MPS init failed ({exc}); using CPU sklearn.")
         
         
         
@@ -91,7 +160,15 @@ class EmotionsDlib():
         
         features = self.geom_feat.get_features(landmarks_frontal)
         features = features.reshape(1, -1)
-        avi_predict = self.emotion_model.predict(features)
+        if self.use_torch:
+            import torch
+            feat_t = torch.as_tensor(
+                features, dtype=torch.float32, device=self.torch_device
+                )
+            avi_predict = torch.matmul(feat_t, self.torch_coef) + self.torch_intercept
+            avi_predict = avi_predict.cpu().numpy()
+        else:
+            avi_predict = self.emotion_model.predict(features)
         avi_predict = np.round(avi_predict, 3)
         
         # TODO: estimate angle from original regression outputs, use intensity
