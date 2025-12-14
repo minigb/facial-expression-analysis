@@ -74,6 +74,7 @@ class EmotionsDlib():
             self.emotion_model = model['model']
             self.full_features = model['full_features']
             self.components = model['components']
+            self.emotion_model = self._patch_sklearn_coef_orientation(self.emotion_model, self.full_features)
 
             # Compatibility shim: older pickled sklearn models may lack the
             # private attributes used by newer sklearn predict(). If missing,
@@ -114,24 +115,9 @@ class EmotionsDlib():
         features = self.geom_feat.get_features(landmarks_frontal)
         features = features.reshape(1, -1)
 
-        # Newer sklearn versions expect coef_ shaped (n_targets, n_features)
-        # for predict(); the stored model (trained on older sklearn) has
-        # coef_ shaped (n_features, n_targets). If predict() fails with a
-        # matmul shape error, compute using the stored statistics on torch/MPS.
-        try:
-            avi_predict = self.emotion_model.predict(features)
-        except ValueError as exc:
-            msg = str(exc)
-            if "matmul" in msg or "core dimension" in msg:
-                avi_predict = self._predict_with_torch(features)
-            else:
-                raise
+        avi_predict = self.emotion_model.predict(features)
         avi_predict = np.round(avi_predict, 3)
         
-        # TODO: estimate angle from original regression outputs, use intensity
-        # as radius and re-estimate arousal and valence
-        
-        # truncate estimations within required limits
         arousal = avi_predict[0][0]
         arousal = np.clip(arousal, -1, 1)
         
@@ -159,22 +145,18 @@ class EmotionsDlib():
         
         return emotions
 
-    def _predict_with_torch(self, features: np.ndarray) -> np.ndarray:
-        device = self._torch_device
-        t_features = torch.from_numpy(features.astype(np.float32)).to(device)
-        t_mean = torch.from_numpy(self.emotion_model.x_mean_.astype(np.float32)).to(device)
-        Xc = t_features - t_mean
-        if hasattr(self.emotion_model, "x_std_"):
-            t_std = torch.from_numpy(self.emotion_model.x_std_.astype(np.float32)).to(device)
-            Xc = Xc / t_std
-        t_coef = torch.from_numpy(self.emotion_model.coef_.astype(np.float32)).to(device)
-        t_pred = Xc @ t_coef
-        if hasattr(self.emotion_model, "y_std_"):
-            t_ystd = torch.from_numpy(self.emotion_model.y_std_.astype(np.float32)).to(device)
-            t_pred = t_pred * t_ystd
-        t_ymean = torch.from_numpy(self.emotion_model.y_mean_.astype(np.float32)).to(device)
-        t_pred = t_pred + t_ymean
-        return t_pred.cpu().numpy()
+    def _patch_sklearn_coef_orientation(self, model, n_features: int):
+        # Many newer sklearn estimators expect:
+        #   coef_.shape == (n_targets, n_features)
+        # Older saved models may have:
+        #   coef_.shape == (n_features, n_targets)
+        if hasattr(model, "coef_"):
+            coef = model.coef_
+            if coef.ndim == 2:
+                # If first dim looks like features, transpose.
+                if coef.shape[0] == n_features and coef.shape[1] != n_features:
+                    model.coef_ = coef.T
+        return model
         
         
     
