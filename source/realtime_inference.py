@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Minimal real-time inference loop that reads camera frames and returns
-valence/arousal/intensity estimates using the provided DLIB-based models.
+Real-time valence/arousal/intensity estimation (process every frame).
+Press q in the video window to quit.
 """
 
 import argparse
@@ -10,7 +10,7 @@ from pathlib import Path
 
 import cv2
 import dlib
-import numpy as np  # ✅ FIX: you used np but didn't import it
+import numpy as np
 
 from emotions_dlib import EmotionsDlib
 
@@ -20,8 +20,8 @@ def parse_args() -> argparse.Namespace:
         description="Real-time valence/arousal/intensity estimation"
     )
     parser.add_argument("--camera", type=int, default=0)
-    parser.add_argument("--smooth", type=float, default=0.7)
-    parser.add_argument("--process-interval", type=float, default=0.5)
+    parser.add_argument("--smooth", type=float, default=0.7,
+                        help="EMA factor for smoothing (0 disables smoothing)")
     parser.add_argument("--no-display", action="store_true")
     return parser.parse_args()
 
@@ -49,9 +49,6 @@ def main():
 
     detector = dlib.get_frontal_face_detector()
     predictor = dlib.shape_predictor(str(paths["predictor"]))
-
-    # If your EmotionsDlib internally depends on torch and you don't have it,
-    # this could crash before any window appears.
     estimator = EmotionsDlib(
         file_emotion_model=str(paths["emotion"]),
         file_frontalization_model=str(paths["frontalization"]),
@@ -70,29 +67,20 @@ def main():
 
     window = "Facial Expression Analysis (press q to quit)"
 
-    # ✅ Force window creation early (and detect headless OpenCV)
     if not args.no_display:
-        try:
-            cv2.namedWindow(window, cv2.WINDOW_NORMAL)
-            # show a tiny dummy frame once to verify GUI actually works
-            dummy = np.zeros((60, 240, 3), dtype=np.uint8)
-            cv2.imshow(window, dummy)
-            cv2.waitKey(1)
-        except cv2.error as e:
-            print(
-                "OpenCV GUI window failed to open. "
-                "You may have opencv-python-headless installed or no display is available.\n"
-                f"Details: {e}\n"
-                "Falling back to --no-display mode.",
-                flush=True,
-            )
-            args.no_display = True
+        # --- PRIME THE WINDOW WITH A REAL FRAME (macOS fix) ---
+        ok, init_frame = cap.read()
+        if not ok or init_frame is None:
+            raise RuntimeError("Failed to read initial frame for window initialization")
+
+        cv2.namedWindow(window, cv2.WINDOW_NORMAL)
+        cv2.imshow(window, init_frame)
+        cv2.waitKey(1)  # <-- THIS is the critical line
 
     disp_valence = disp_arousal = disp_intensity = 0.0
     alpha = max(0.0, min(args.smooth, 1.0))
-    process_interval = max(0.0, args.process_interval)
+
     last_print = 0.0
-    last_process = 0.0
     read_failures = 0
     max_failures_before_reopen = 15
     text = "Initializing..."
@@ -112,13 +100,13 @@ def main():
                         break
 
                 if not args.no_display:
-                    status_frame = 255 * np.ones((240, 320, 3), dtype=np.uint8)
+                    status_frame = 255 * np.ones((540, 960, 3), dtype=np.uint8)
                     cv2.putText(
                         status_frame,
                         "Reconnecting camera...",
-                        (10, 30),
+                        (20, 50),
                         cv2.FONT_HERSHEY_SIMPLEX,
-                        0.7,
+                        1.0,
                         (0, 0, 255),
                         2,
                         cv2.LINE_AA,
@@ -130,47 +118,49 @@ def main():
             read_failures = 0
             now = time.time()
 
-            if (now - last_process) >= process_interval:
-                gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-                faces = detector(gray)
+            # ✅ Process EVERY frame (interval logic removed)
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            faces = detector(gray)
 
-                text = "No face detected"
-                if len(faces) > 0:
-                    face = choose_largest_face(faces)
-                    landmarks_obj = predictor(gray, face)
-                    emotions = estimator.get_emotions(landmarks_obj)
+            text = "No face detected"
+            if len(faces) > 0:
+                face = choose_largest_face(faces)
+                landmarks_obj = predictor(gray, face)
+                emotions = estimator.get_emotions(landmarks_obj)
 
-                    valence = emotions["emotions"]["valence"]
-                    arousal = emotions["emotions"]["arousal"]
-                    intensity = emotions["emotions"]["intensity"]
-                    name = emotions["emotions"]["name"]
+                valence = emotions["emotions"]["valence"]
+                arousal = emotions["emotions"]["arousal"]
+                intensity = emotions["emotions"]["intensity"]
+                name = emotions["emotions"]["name"]
 
-                    if alpha > 0:
-                        disp_valence = alpha * valence + (1 - alpha) * disp_valence
-                        disp_arousal = alpha * arousal + (1 - alpha) * disp_arousal
-                        disp_intensity = alpha * intensity + (1 - alpha) * disp_intensity
-                    else:
-                        disp_valence, disp_arousal, disp_intensity = valence, arousal, intensity
+                if alpha > 0:
+                    disp_valence = alpha * valence + (1 - alpha) * disp_valence
+                    disp_arousal = alpha * arousal + (1 - alpha) * disp_arousal
+                    disp_intensity = alpha * intensity + (1 - alpha) * disp_intensity
+                else:
+                    disp_valence, disp_arousal, disp_intensity = valence, arousal, intensity
 
-                    text = f"V={disp_valence:.3f} | A={disp_arousal:.3f} | I={disp_intensity:.3f} | {name}"
+                text = f"V={disp_valence:.3f} | A={disp_arousal:.3f} | I={disp_intensity:.3f} | {name}"
 
-                    if not args.no_display:
-                        cv2.rectangle(
-                            frame,
-                            (face.left(), face.top()),
-                            (face.right(), face.bottom()),
-                            (0, 255, 0),
-                            1,
-                        )
-
-                last_process = now
+                if not args.no_display:
+                    cv2.rectangle(
+                        frame,
+                        (face.left(), face.top()),
+                        (face.right(), face.bottom()),
+                        (0, 255, 0),
+                        2,
+                    )
 
             if now - last_print > 0.2:
                 print(text, flush=True)
                 last_print = now
 
             if not args.no_display:
-                cv2.putText(frame, text, (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2, cv2.LINE_AA)
+                cv2.putText(
+                    frame, text, (10, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.8,
+                    (0, 255, 0), 2, cv2.LINE_AA
+                )
                 cv2.imshow(window, frame)
                 key = cv2.waitKey(1) & 0xFF
                 if key == ord("q"):
@@ -180,6 +170,7 @@ def main():
 
     except KeyboardInterrupt:
         print("Interrupted by user, closing gracefully.", flush=True)
+
     finally:
         cap.release()
         if not args.no_display:
