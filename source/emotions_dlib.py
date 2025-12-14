@@ -16,6 +16,7 @@ import numpy as np
 import math
 from joblib import load
 import matplotlib.pyplot as plt
+import torch
 
 
 
@@ -34,7 +35,8 @@ class EmotionsDlib():
     def __init__(
             self, 
             file_emotion_model, 
-            file_frontalization_model
+            file_frontalization_model,
+            use_torch_mps: bool = True
             ):
         '''
         file_emotion_model: string
@@ -55,6 +57,11 @@ class EmotionsDlib():
             
         model = None
         self.full_features = True  # default feature size
+        self._torch_device = (
+            torch.device("mps")
+            if use_torch_mps and torch.backends.mps.is_available()
+            else torch.device("cpu")
+        )
         
         # loading pickled emotion model
         try:
@@ -67,6 +74,21 @@ class EmotionsDlib():
             self.emotion_model = model['model']
             self.full_features = model['full_features']
             self.components = model['components']
+
+            # Compatibility shim: older pickled sklearn models may lack the
+            # private attributes used by newer sklearn predict(). If missing,
+            # copy from the public counterparts that are present after load.
+            for old_attr, new_attr in [
+                    ('_x_mean', 'x_mean_'),
+                    ('_y_mean', 'y_mean_'),
+                    ('_x_std', 'x_std_'),
+                    ('_y_std', 'y_std_')
+                ]:
+                if (not hasattr(self.emotion_model, old_attr)
+                        and hasattr(self.emotion_model, new_attr)):
+                    setattr(self.emotion_model, old_attr,
+                            getattr(self.emotion_model, new_attr))
+
             print(
                 'Model components:', self.components, 
                   ' | full feature size:', self.full_features
@@ -91,25 +113,42 @@ class EmotionsDlib():
         
         features = self.geom_feat.get_features(landmarks_frontal)
         features = features.reshape(1, -1)
-        avi_predict = self.emotion_model.predict(features)
+
+        # If the stored coef_ is in the old orientation (n_features, n_targets),
+        # transpose it once to the expected (n_targets, n_features).
+        m = self.emotion_model
+        if hasattr(m, "coef_") and m.coef_.ndim == 2:
+            if m.coef_.shape[0] == features.shape[1] and m.coef_.shape[1] != features.shape[1]:
+                m.coef_ = m.coef_.T
+
+        # Some older pickles lack intercept_. PLSRegression predicts:
+        #   X @ coef_.T + intercept_
+        # Use stored y_mean_ as the intercept fallback if missing.
+        if not hasattr(m, "intercept_"):
+            if hasattr(m, "y_mean_"):
+                m.intercept_ = m.y_mean_
+            else:
+                # fallback to zeros with n_targets
+                n_targets = m.coef_.shape[0] if m.coef_.ndim >= 1 else 1
+                m.intercept_ = np.zeros(n_targets)
+
+        # Newer sklearn sets _predict_1d in fit(). Older pickles may miss it.
+        # Default to False (multi-output), which matches our 3-target model.
+        if not hasattr(m, "_predict_1d"):
+            m._predict_1d = False
+
+        avi_predict = m.predict(features)
         avi_predict = np.round(avi_predict, 3)
         
-        # TODO: estimate angle from original regression outputs, use intensity
-        # as radius and re-estimate arousal and valence
-        
-        # truncate estimations within required limits
         arousal = avi_predict[0][0]
-        if arousal > 1: arousal=1
-        elif arousal < -1: arousal=-1
+        arousal = np.clip(arousal, -1, 1)
         
         valence = avi_predict[0][1]
-        if valence > 1: valence=1
-        elif valence < -1: valence=-1
+        valence = np.clip(valence, -1, 1)
         
         # intensity = avi_predict[0][2]  # this overestimates the intensity
         intensity = round(math.sqrt(valence ** 2 + arousal ** 2), 3)  # altern
-        if intensity > 1: intensity=1
-        elif intensity < 0: intensity=0
+        intensity = np.clip(intensity, 0, 1)
         
         emotion_name = self.avi_to_text(
             arousal=arousal, 
@@ -127,8 +166,7 @@ class EmotionsDlib():
         emotions['landmarks']['frontal'] = landmarks_frontal
         
         return emotions
-        
-        
+
     
     def avi_to_text(self, arousal, valence, intensity=None):
         '''
