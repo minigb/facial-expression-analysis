@@ -74,7 +74,6 @@ class EmotionsDlib():
             self.emotion_model = model['model']
             self.full_features = model['full_features']
             self.components = model['components']
-            self.emotion_model = self._patch_sklearn_coef_orientation(self.emotion_model, self.full_features)
 
             # Compatibility shim: older pickled sklearn models may lack the
             # private attributes used by newer sklearn predict(). If missing,
@@ -115,7 +114,30 @@ class EmotionsDlib():
         features = self.geom_feat.get_features(landmarks_frontal)
         features = features.reshape(1, -1)
 
-        avi_predict = self.emotion_model.predict(features)
+        # If the stored coef_ is in the old orientation (n_features, n_targets),
+        # transpose it once to the expected (n_targets, n_features).
+        m = self.emotion_model
+        if hasattr(m, "coef_") and m.coef_.ndim == 2:
+            if m.coef_.shape[0] == features.shape[1] and m.coef_.shape[1] != features.shape[1]:
+                m.coef_ = m.coef_.T
+
+        # Some older pickles lack intercept_. PLSRegression predicts:
+        #   X @ coef_.T + intercept_
+        # Use stored y_mean_ as the intercept fallback if missing.
+        if not hasattr(m, "intercept_"):
+            if hasattr(m, "y_mean_"):
+                m.intercept_ = m.y_mean_
+            else:
+                # fallback to zeros with n_targets
+                n_targets = m.coef_.shape[0] if m.coef_.ndim >= 1 else 1
+                m.intercept_ = np.zeros(n_targets)
+
+        # Newer sklearn sets _predict_1d in fit(). Older pickles may miss it.
+        # Default to False (multi-output), which matches our 3-target model.
+        if not hasattr(m, "_predict_1d"):
+            m._predict_1d = False
+
+        avi_predict = m.predict(features)
         avi_predict = np.round(avi_predict, 3)
         
         arousal = avi_predict[0][0]
@@ -145,20 +167,6 @@ class EmotionsDlib():
         
         return emotions
 
-    def _patch_sklearn_coef_orientation(self, model, n_features: int):
-        # Many newer sklearn estimators expect:
-        #   coef_.shape == (n_targets, n_features)
-        # Older saved models may have:
-        #   coef_.shape == (n_features, n_targets)
-        if hasattr(model, "coef_"):
-            coef = model.coef_
-            if coef.ndim == 2:
-                # If first dim looks like features, transpose.
-                if coef.shape[0] == n_features and coef.shape[1] != n_features:
-                    model.coef_ = coef.T
-        return model
-        
-        
     
     def avi_to_text(self, arousal, valence, intensity=None):
         '''
