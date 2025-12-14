@@ -16,6 +16,7 @@ import numpy as np
 import math
 from joblib import load
 import matplotlib.pyplot as plt
+import torch
 
 
 
@@ -34,7 +35,8 @@ class EmotionsDlib():
     def __init__(
             self, 
             file_emotion_model, 
-            file_frontalization_model
+            file_frontalization_model,
+            use_torch_mps: bool = True
             ):
         '''
         file_emotion_model: string
@@ -55,6 +57,11 @@ class EmotionsDlib():
             
         model = None
         self.full_features = True  # default feature size
+        self._torch_device = (
+            torch.device("mps")
+            if use_torch_mps and torch.backends.mps.is_available()
+            else torch.device("cpu")
+        )
         
         # loading pickled emotion model
         try:
@@ -110,21 +117,13 @@ class EmotionsDlib():
         # Newer sklearn versions expect coef_ shaped (n_targets, n_features)
         # for predict(); the stored model (trained on older sklearn) has
         # coef_ shaped (n_features, n_targets). If predict() fails with a
-        # matmul shape error, compute using the stored statistics and the
-        # older orientation.
+        # matmul shape error, compute using the stored statistics on torch/MPS.
         try:
             avi_predict = self.emotion_model.predict(features)
         except ValueError as exc:
             msg = str(exc)
             if "matmul" in msg or "core dimension" in msg:
-                # manual predict: ((X - mean) / std) @ coef_  -> rescale -> + mean
-                Xc = features - self.emotion_model.x_mean_
-                if hasattr(self.emotion_model, "x_std_"):
-                    Xc = Xc / self.emotion_model.x_std_
-                avi_predict = Xc @ self.emotion_model.coef_
-                if hasattr(self.emotion_model, "y_std_"):
-                    avi_predict = avi_predict * self.emotion_model.y_std_
-                avi_predict = avi_predict + self.emotion_model.y_mean_
+                avi_predict = self._predict_with_torch(features)
             else:
                 raise
         avi_predict = np.round(avi_predict, 3)
@@ -162,6 +161,23 @@ class EmotionsDlib():
         emotions['landmarks']['frontal'] = landmarks_frontal
         
         return emotions
+
+    def _predict_with_torch(self, features: np.ndarray) -> np.ndarray:
+        device = self._torch_device
+        t_features = torch.from_numpy(features.astype(np.float32)).to(device)
+        t_mean = torch.from_numpy(self.emotion_model.x_mean_.astype(np.float32)).to(device)
+        Xc = t_features - t_mean
+        if hasattr(self.emotion_model, "x_std_"):
+            t_std = torch.from_numpy(self.emotion_model.x_std_.astype(np.float32)).to(device)
+            Xc = Xc / t_std
+        t_coef = torch.from_numpy(self.emotion_model.coef_.astype(np.float32)).to(device)
+        t_pred = Xc @ t_coef
+        if hasattr(self.emotion_model, "y_std_"):
+            t_ystd = torch.from_numpy(self.emotion_model.y_std_.astype(np.float32)).to(device)
+            t_pred = t_pred * t_ystd
+        t_ymean = torch.from_numpy(self.emotion_model.y_mean_.astype(np.float32)).to(device)
+        t_pred = t_pred + t_ymean
+        return t_pred.cpu().numpy()
         
         
     

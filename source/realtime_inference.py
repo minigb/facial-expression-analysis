@@ -51,8 +51,8 @@ def parse_args() -> argparse.Namespace:
         action="store_false",
         dest="mps",
         default=True,
-        help="(Deprecated) kept for CLI compatibility; has no effect.",
-    )  # retained to avoid breaking existing scripts
+        help="Use torch MPS acceleration when available (on by default).",
+    )
     return parser.parse_args()
 
 
@@ -82,6 +82,7 @@ def main():
     estimator = EmotionsDlib(
         file_emotion_model=str(paths["emotion"]),
         file_frontalization_model=str(paths["frontalization"]),
+        use_torch_mps=args.mps,
     )
 
     cap = cv2.VideoCapture(args.camera)
