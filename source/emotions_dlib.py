@@ -133,17 +133,14 @@ class EmotionsDlib():
         
         # truncate estimations within required limits
         arousal = avi_predict[0][0]
-        if arousal > 1: arousal=1
-        elif arousal < -1: arousal=-1
+        arousal = np.clip(arousal, -1, 1)
         
         valence = avi_predict[0][1]
-        if valence > 1: valence=1
-        elif valence < -1: valence=-1
+        valence = np.clip(valence, -1, 1)
         
         # intensity = avi_predict[0][2]  # this overestimates the intensity
         intensity = round(math.sqrt(valence ** 2 + arousal ** 2), 3)  # altern
-        if intensity > 1: intensity=1
-        elif intensity < 0: intensity=0
+        intensity = np.clip(intensity, 0, 1)
         
         emotion_name = self.avi_to_text(
             arousal=arousal, 
