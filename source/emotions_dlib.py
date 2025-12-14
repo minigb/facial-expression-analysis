@@ -67,6 +67,21 @@ class EmotionsDlib():
             self.emotion_model = model['model']
             self.full_features = model['full_features']
             self.components = model['components']
+
+            # Compatibility shim: older pickled sklearn models may lack the
+            # private attributes used by newer sklearn predict(). If missing,
+            # copy from the public counterparts that are present after load.
+            for old_attr, new_attr in [
+                    ('_x_mean', 'x_mean_'),
+                    ('_y_mean', 'y_mean_'),
+                    ('_x_std', 'x_std_'),
+                    ('_y_std', 'y_std_')
+                ]:
+                if (not hasattr(self.emotion_model, old_attr)
+                        and hasattr(self.emotion_model, new_attr)):
+                    setattr(self.emotion_model, old_attr,
+                            getattr(self.emotion_model, new_attr))
+
             print(
                 'Model components:', self.components, 
                   ' | full feature size:', self.full_features
@@ -91,7 +106,27 @@ class EmotionsDlib():
         
         features = self.geom_feat.get_features(landmarks_frontal)
         features = features.reshape(1, -1)
-        avi_predict = self.emotion_model.predict(features)
+
+        # Newer sklearn versions expect coef_ shaped (n_targets, n_features)
+        # for predict(); the stored model (trained on older sklearn) has
+        # coef_ shaped (n_features, n_targets). If predict() fails with a
+        # matmul shape error, compute using the stored statistics and the
+        # older orientation.
+        try:
+            avi_predict = self.emotion_model.predict(features)
+        except ValueError as exc:
+            msg = str(exc)
+            if "matmul" in msg or "core dimension" in msg:
+                # manual predict: ((X - mean) / std) @ coef_  -> rescale -> + mean
+                Xc = features - self.emotion_model.x_mean_
+                if hasattr(self.emotion_model, "x_std_"):
+                    Xc = Xc / self.emotion_model.x_std_
+                avi_predict = Xc @ self.emotion_model.coef_
+                if hasattr(self.emotion_model, "y_std_"):
+                    avi_predict = avi_predict * self.emotion_model.y_std_
+                avi_predict = avi_predict + self.emotion_model.y_mean_
+            else:
+                raise
         avi_predict = np.round(avi_predict, 3)
         
         # TODO: estimate angle from original regression outputs, use intensity
